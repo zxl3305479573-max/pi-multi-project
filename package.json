@@ -1,0 +1,24 @@
+{
+  "name": "pi-multi-project",
+  "version": "0.1.0-beta.1",
+  "description": "pi 扩展合集：跨项目任务栏 + 项目级长期记忆",
+  "license": "MIT",
+  "type": "module",
+  "keywords": ["pi", "pi-extension", "agents.md", "memory", "taskbar"],
+  "pi": {
+    "extensions": ["./extensions/pi-tasks.ts", "./extensions/pi-memory.ts"]
+  },
+  "scripts": {
+    "setup": "node scripts/setup-dev.mjs",
+    "precheck": "node scripts/setup-dev.mjs",
+    "check": "tsc -p tsconfig.json",
+    "pretest": "node scripts/setup-dev.mjs",
+    "test": "node test/smoke-tasks.mjs && node test/smoke-memory.mjs",
+    "test:tasks": "node test/smoke-tasks.mjs",
+    "test:memory": "node test/smoke-memory.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}

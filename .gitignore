@@ -1,0 +1,8 @@
+node_modules/
+package-lock.json
+.tmp/
+*.tmp-*
+*.log
+
+# 测试与运行时产物（万一跑在仓库里）
+.pi/memory-archive.md

@@ -1,0 +1,20 @@
+{
+  "// 说明": "扩展由 pi 用 jiti + alias 加载，不走 node_modules 解析。npm run setup 会在本仓库 node_modules 下建软链接，让 tsc 也能解析到同样的包 —— 所以这里不需要任何机器相关的 paths。",
+  "compilerOptions": {
+    "noEmit": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "types": ["node"],
+
+    "strict": true,
+
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true
+  },
+  "include": ["extensions/**/*.ts"]
+}

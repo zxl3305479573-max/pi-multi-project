@@ -7,7 +7,7 @@
  */
 import path from "node:path";
 import fs from "node:fs";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { makeSandbox, loadExtension, makeChecker } from "./_harness.mjs";
 import { addSession, makeProjectDir } from "./fixtures.mjs";
 
@@ -22,9 +22,23 @@ process.env.PI_CODING_AGENT_DIR = AGENT;
 // 造两个「真项目」和它们的会话
 const PROJ_A = makeProjectDir(SB.path("proj-alpha"));
 const PROJ_B = makeProjectDir(SB.path("proj-beta"));
+const WORKTREE_MAIN = SB.path("worktree-repo");
+const WORKTREE_FEATURE = path.join(WORKTREE_MAIN, ".worktrees", "feature");
+fs.mkdirSync(WORKTREE_MAIN, { recursive: true });
+const git = (args, cwd = WORKTREE_MAIN) =>
+	execFileSync("git", args, { cwd, encoding: "utf8", windowsHide: true });
+git(["init", "-q", "-b", "main"]);
+git(["config", "user.name", "测试用户"]);
+git(["config", "user.email", "test@example.invalid"]);
+fs.writeFileSync(path.join(WORKTREE_MAIN, "README.md"), "# worktree fixture\n", "utf8");
+git(["add", "README.md"]);
+git(["commit", "-q", "-m", "初始化夹具"]);
+git(["worktree", "add", "-q", "-b", "feature/worktree", WORKTREE_FEATURE]);
 await addSession(PROJ_A, "alpha 第一条会话");
 await addSession(PROJ_A, "alpha 第二条会话");
 await addSession(PROJ_B, "beta 的会话");
+await addSession(WORKTREE_MAIN, "主 worktree 的会话");
+await addSession(WORKTREE_FEATURE, "feature worktree 的会话");
 
 const CONFIG_PATH = path.join(AGENT, "pi-tasks.json");
 const factory = await loadExtension("extensions/pi-tasks.ts");
@@ -144,12 +158,19 @@ try {
 	console.log(`  版本 ${idx.version}  项目 ${idx.projects.length}  建于 ${new Date(idx.builtAt).toISOString()}`);
 	for (const p of idx.projects) {
 		console.log(
-			`   ${p.noise ? "·" : "▸"} ${p.name.padEnd(24)} tier=${p.tier} git=${p.isGit ? "y" : "n"} sessions=${p.sessionCount} missing=${p.missing} branch=${p.branch ?? "-"}`,
+			`   ${p.noise ? "·" : "▸"} ${p.name.padEnd(24)} tier=${p.tier} git=${p.isGit ? "y" : "n"} sessions=${p.sessionCount} worktrees=${p.worktreeCount ?? 1} missing=${p.missing} branch=${p.branch ?? "-"}`,
 		);
 	}
 } catch (e) {
 	console.log("  读取失败:", e.message);
 }
+
+const worktreeGroup = JSON.parse(fs.readFileSync(idxPath, "utf8")).projects.find((p) => p.key.startsWith("worktree:"));
+check("同仓库 worktree 合并为一个项目", !!worktreeGroup, `实际 ${worktreeGroup ? "已合并" : "缺失"}`);
+check("worktree 项目保留两个会话", worktreeGroup?.sessionCount === 2, `实际 ${worktreeGroup?.sessionCount ?? 0}`);
+check("worktree 数量正确", worktreeGroup?.worktreeCount === 2, `实际 ${worktreeGroup?.worktreeCount ?? 0}`);
+check("worktree 分支集合已显示", (worktreeGroup?.branch ?? "").includes("main") && (worktreeGroup?.branch ?? "").includes("feature/worktree"));
+check("常驻任务栏标记 worktree 数", (cap.widget.get("pi-tasks-bar") ?? []).some((l) => l.includes("⎇2")));
 
 console.log("\n── /projects 选择器（选第 2 行）───────");
 cap.notes.length = 0;

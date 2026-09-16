@@ -45,6 +45,6 @@
 
 ## 测试
 
-改动必须让 `npm test` 保持全绿（tasks 19 项 + memory 80 项），并且 `npm run check` 零错误。
+改动必须让 `npm test` 保持全绿（tasks 24 项 + memory 86 项），并且 `npm run check` 零错误。
 
 测试**不得触碰**真实 `~/.pi` 与真实家目录——用 `test/_harness.mjs` 的沙箱。

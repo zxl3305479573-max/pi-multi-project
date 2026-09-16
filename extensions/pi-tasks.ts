@@ -57,6 +57,7 @@ const DEFAULT_MAX_ROWS = 5;
 const GIT_TIMEOUT_MS = 2500;
 const STALE_LOCK_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_BRANCH_LOOKUPS = 8;
+const MAX_BRANCH_CWDS = 3;
 const MAX_SESSION_ROWS = 30;
 
 const STATUS_KEY = "pi-tasks";
@@ -92,6 +93,7 @@ interface ProjectRecord {
 	isGit: boolean;
 	isProject: boolean; // 有 .git / 清单文件 / .pi
 	branch?: string;
+	worktreeCount: number;
 	missing: boolean; // 目录已不存在
 	pinned: boolean;
 	noise: boolean; // 被过滤，不进主列表
@@ -324,6 +326,94 @@ async function getBranch(pi: ExtensionAPI, cwd: string): Promise<string | undefi
 	}
 }
 
+interface ProjectIdentity {
+	key: string;
+	displayCwd: string;
+	worktreeCount: number;
+}
+
+/**
+ * 项目身份缓存。
+ *
+ * 为什么要有缓存：renderStatus / renderBar 每次重绘都要问「当前 cwd 属于哪个项目」。
+ * 若每次重绘都起 git 子进程，TUI 会明显卡顿（Windows 上单次探测约 70ms）。
+ * 所以索引重建时异步并发算好放进这里，渲染只查表；
+ * 表里没有（刚启动、还没重建完）就退化成归一化 cwd，下次重建自动纠正。
+ */
+const identityCache = new Map<string, { at: number; value: ProjectIdentity }>();
+const IDENTITY_TTL_MS = 30_000;
+
+function plainIdentity(cwd: string): ProjectIdentity {
+	return { key: normalizeKey(cwd), displayCwd: cwd, worktreeCount: 1 };
+}
+
+/** 只查表，绝不起子进程 —— 渲染路径专用。 */
+function cachedIdentity(cwd: string): ProjectIdentity {
+	return identityCache.get(normalizeKey(cwd))?.value ?? plainIdentity(cwd);
+}
+
+/**
+ * 用 git 判定 cwd 是否属于一个有多个 worktree 的仓库。
+ *
+ * 同一仓库的多个 worktree 共享同一份历史和对象库，任务栏里应该是一个项目。
+ * 判定依据是两个稳定事实：`--git-common-dir` 指向共同 .git，
+ * `worktree list` 列出全部 working tree。任一失败（无 git / 不是仓库 / 超时）
+ * 就退化成普通 cwd 身份 —— 宁可少合并，也不能因为 git 不可用而丢项目。
+ */
+async function resolveIdentity(pi: ExtensionAPI, cwd: string): Promise<ProjectIdentity> {
+	const ck = normalizeKey(cwd);
+	const hit = identityCache.get(ck);
+	if (hit && Date.now() - hit.at < IDENTITY_TTL_MS) return hit.value;
+
+	let value = plainIdentity(cwd);
+	try {
+		const common = await pi.exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+			cwd,
+			timeout: GIT_TIMEOUT_MS,
+		});
+		const commonDir = common.code === 0 ? common.stdout.trim() : "";
+
+		if (commonDir && path.isAbsolute(commonDir)) {
+			const list = await pi.exec("git", ["worktree", "list", "--porcelain"], {
+				cwd,
+				timeout: GIT_TIMEOUT_MS,
+			});
+			const roots =
+				list.code === 0
+					? [...list.stdout.matchAll(/^worktree (.+)$/gm)].map((m) => m[1].trim())
+					: [];
+
+			if (roots.length >= 2) {
+				value = {
+					key: `worktree:${normalizeKey(commonDir)}`,
+					displayCwd: roots[0],
+					worktreeCount: roots.length,
+				};
+				// 同组的兄弟 worktree 直接写入缓存：它们的身份必然相同，
+				// 没必要各自再去起两次 git 子进程。
+				const at = Date.now();
+				for (const root of roots) identityCache.set(normalizeKey(root), { at, value });
+			}
+		}
+	} catch {
+		/* git 不存在 / 超时 → 用普通 cwd 身份 */
+	}
+
+	identityCache.set(ck, { at: Date.now(), value });
+	return value;
+}
+
+async function getBranches(pi: ExtensionAPI, cwds: string[]): Promise<string | undefined> {
+	const branches = new Set<string>();
+	// 一个 worktree 集合可能有多个 cwd，但它们通常在同几个分支上。
+	// 取前 MAX_BRANCH_CWDS 个即可，避免工作树一多就起一堆子进程。
+	for (const cwd of cwds.slice(0, MAX_BRANCH_CWDS)) {
+		const branch = await getBranch(pi, cwd);
+		if (branch) branches.add(branch);
+	}
+	return branches.size > 0 ? [...branches].join(" + ") : undefined;
+}
+
 // ─────────────────────────────────────────────────────────────
 // 索引构建
 // ─────────────────────────────────────────────────────────────
@@ -365,18 +455,23 @@ async function buildIndex(pi: ExtensionAPI, config: TasksConfig): Promise<TasksI
 		sessions = [];
 	}
 
-	// 1) 按归一化 cwd 分组
-	const grouped = new Map<string, { cwd: string; sessions: SessionRef[] }>();
+	// 0) 先解析所有不同 cwd 的项目身份（同一仓库的 worktree 归为一组）。
+	//    并发执行，避免按会话数串行起 git 子进程。
+	const distinctCwds = [...new Set(sessions.map((s) => s.cwd).filter((c): c is string => !!c))];
+	await Promise.all(distinctCwds.map((cwd) => resolveIdentity(pi, cwd)));
+
+	// 1) 按项目身份分组；同一 Git worktree 集合共享一个任务栏项目
+	const grouped = new Map<string, { cwd: string; sessions: SessionRef[]; worktreeCount: number }>();
 
 	for (const s of sessions) {
 		const cwd = s.cwd ?? "";
 		if (!cwd) continue; // 老会话可能没有 cwd
 
-		const key = normalizeKey(cwd);
-		let bucket = grouped.get(key);
+		const identity = cachedIdentity(cwd);
+		let bucket = grouped.get(identity.key);
 		if (!bucket) {
-			bucket = { cwd, sessions: [] };
-			grouped.set(key, bucket);
+			bucket = { cwd: identity.displayCwd, sessions: [], worktreeCount: identity.worktreeCount };
+			grouped.set(identity.key, bucket);
 		}
 
 		bucket.sessions.push({
@@ -411,6 +506,7 @@ async function buildIndex(pi: ExtensionAPI, config: TasksConfig): Promise<TasksI
 			sessionCount: bucket.sessions.length,
 			isGit,
 			isProject,
+			worktreeCount: bucket.worktreeCount,
 			missing: !pathExists(bucket.cwd),
 			pinned,
 			noise,
@@ -428,7 +524,7 @@ async function buildIndex(pi: ExtensionAPI, config: TasksConfig): Promise<TasksI
 
 	await Promise.all(
 		branchTargets.map(async (p) => {
-			p.branch = await getBranch(pi, p.cwd);
+			p.branch = await getBranches(pi, [...new Set(p.sessions.map((s) => s.cwd))]);
 		}),
 	);
 
@@ -476,8 +572,9 @@ function rowText(project: ProjectRecord, current: boolean, lock?: LockInfo): str
 	const cursor = current ? "▸" : " ";
 	const lockTag = lock ? " ●" : "  ";
 	const branch = project.branch ? `  ${project.branch}` : "";
+	const worktrees = project.worktreeCount > 1 ? `  ⎇${project.worktreeCount}` : "";
 	const missing = project.missing ? "  (missing)" : "";
-	return `${cursor} ${pad(project.name, 22)} ${pad(ago(project.lastActive), 4)}${lockTag} ${pad(`${project.sessionCount}s`, 4)}${branch}${missing}`;
+	return `${cursor} ${pad(project.name, 22)} ${pad(ago(project.lastActive), 4)}${lockTag} ${pad(`${project.sessionCount}s`, 4)}${worktrees}${branch}${missing}`;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -509,7 +606,7 @@ export default function (pi: ExtensionAPI) {
 		if (!ctx.hasUI) return;
 
 		const list = visibleProjects();
-		const currentKey = normalizeKey(ctx.cwd);
+		const currentKey = cachedIdentity(ctx.cwd).key;
 		const current = list.find((p) => p.key === currentKey);
 		const label = current?.name ?? (path.basename(ctx.cwd) || "?");
 
@@ -527,7 +624,7 @@ export default function (pi: ExtensionAPI) {
 		if (!ctx.hasUI) return;
 
 		const list = visibleProjects();
-		const currentKey = normalizeKey(ctx.cwd);
+		const currentKey = cachedIdentity(ctx.cwd).key;
 
 		// 激活态：无论 config.bar 开关如何都要显示（用户正看着它导航）
 		if (taskbarActive && list.length > 0) {
@@ -540,7 +637,7 @@ export default function (pi: ExtensionAPI) {
 				const selected = start + i === taskbarIndex;
 				const line =
 					`${selected ? "▶" : " "} ${pad(p.name, 22)} ${pad(ago(p.lastActive), 4)} ` +
-					`${lockOf(locks, p) ? "●" : " "} ${pad(`${p.sessionCount}s`, 4)}${p.branch ? `  ${p.branch}` : ""}`;
+					`${lockOf(locks, p) ? "●" : " "} ${pad(`${p.sessionCount}s`, 4)}${p.worktreeCount > 1 ? `  ⎇${p.worktreeCount}` : ""}${p.branch ? `  ${p.branch}` : ""}`;
 				if (selected) return ctx.ui.theme.fg("accent", line);
 				return ctx.ui.theme.fg(p.key === currentKey ? "text" : "dim", line);
 			});
@@ -592,7 +689,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		taskbarActive = true;
-		const i = list.findIndex((p) => p.key === normalizeKey(ctx.cwd));
+		const i = list.findIndex((p) => p.key === cachedIdentity(ctx.cwd).key);
 		taskbarIndex = i >= 0 ? i : 0;
 		renderBar(ctx);
 	}
@@ -786,7 +883,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const currentKey = normalizeKey(ctx.cwd);
+		const currentKey = cachedIdentity(ctx.cwd).key;
 		const rows: string[] = [];
 
 		list.forEach((p, i) => {
@@ -857,8 +954,9 @@ export default function (pi: ExtensionAPI) {
 	// ── 命令 ────────────────────────────────────────────────
 
 	function findProjectByPath(input: string): ProjectRecord | undefined {
-		const key = normalizeKey(input);
-		return (index?.projects ?? []).find((p) => p.key === key);
+		return (index?.projects ?? []).find(
+			(p) => p.key === cachedIdentity(input).key || normalizeKey(p.cwd) === normalizeKey(input),
+		);
 	}
 
 	const HELP = [
@@ -909,7 +1007,9 @@ export default function (pi: ExtensionAPI) {
 					// 故意用归一化 cwd key 定位而不是数组下标 —— 索引可能因重建而重排。
 					if (!arg) return;
 					if (isIndexStale()) await rebuild(ctx);
-					const picked = (index?.projects ?? []).find((p) => p.key === normalizeKey(arg));
+					const picked = (index?.projects ?? []).find(
+						(p) => p.key === arg || p.key === cachedIdentity(arg).key,
+					);
 					if (!picked) {
 						ctx.ui.notify(`pi-tasks: 未找到项目 ${arg}`, "error");
 						return;
@@ -963,7 +1063,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify(`用法：/projects ${sub} <项目路径>`, "warning");
 						return;
 					}
-					const key = normalizeKey(arg);
+					const key = cachedIdentity(arg).key;
 					if (sub === "hide" || sub === "unhide") {
 						config.hidden = config.hidden.filter((k) => k !== key);
 						if (sub === "hide") config.hidden.push(key);

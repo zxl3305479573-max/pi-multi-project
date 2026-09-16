@@ -5,9 +5,9 @@
 | 扩展 | 作用 |
 |---|---|
 | **pi-tasks** | 跨项目任务栏：一眼看到有哪些项目、一键切换、防止两个终端写坏同一个会话 |
-| **pi-memory** | 项目级长期记忆：把架构决策和踩过的坑沉淀进项目的 `AGENTS.md`，下次自动注入 |
+| **pi-memory** | 项目级长期记忆：普通项目写入 `AGENTS.md`；Git worktree 集合写入共同 `.git/pi-memory/` 并自动注入当前上下文 |
 
-> **状态：beta。** 逻辑层有 99 项自动化断言覆盖，但**真实 TUI 交互尚未充分验证**（详见[已知限制](#已知限制)）。
+> **状态：beta。** 逻辑层有 110 项自动化断言覆盖，但**真实 TUI 交互尚未充分验证**（详见[已知限制](#已知限制)）。
 
 ---
 
@@ -66,7 +66,7 @@ proj-alpha  ·  ▸3  ·  +2 other  ·  ●1 busy
 ### 设计要点
 
 - **索引是缓存，不是第二份存储。** 真相只有一份——pi 自己的会话文件。索引（`~/.pi/agent/index/tasks-index.json`）删掉能无损重建，永远不会与对话漂移。这正好也让它天然成为将来做"跨会话召回"的数据源。
-- **项目身份用归一化 cwd**，不用 git remote。代价是换 clone 位置记忆会断，好处是可预测。
+- **项目身份默认用归一化 cwd；Git worktree 集合例外。** 通过 `git worktree list --porcelain` 与 `git rev-parse --git-common-dir` 识别同一仓库的多个 worktree，并将它们合并为一个任务栏项目，分支显示在同一行。不同 clone 位置仍是不同项目。
 - **自动过滤探测垃圾**：系统 temp、`node_modules`、`.cache`、已不存在的目录都不显示。实测一台机器上 12 条会话里 8 条是临时探测目录。
 - **并发靠 pid 锁**：`~/.pi/agent/locks/<sessionId>.lock` 存 pid，启动时写、退出时删，读锁时顺手清理进程已死的僵尸锁。
 - **陈旧检测很廉价**：只 `stat` 各会话目录的 mtime，比索引的 `builtAt` 新才重建，不解析 JSONL。
@@ -86,6 +86,8 @@ pi 原生会**读取** `AGENTS.md` 并注入 system prompt（并按 cwd 逐级�
 ### 职责边界
 
 **只管项目层。** 全局偏好请手写 `~/.pi/agent/AGENTS.md`——pi 原生就会加载它，而几条稳定偏好手写比走扩展更划算（零依赖、完全可控）。
+
+Git worktree 集合使用共享项目记忆：记忆和归档放在共同 `.git/pi-memory/`，不写入任何分支 checkout，也不进入 Git；pi-memory 在每次模型调用前通过原生 `before_agent_start` 追加到当前 system prompt。普通项目仍使用当前目录的 `AGENTS.md`。
 
 ### 用法
 
@@ -109,7 +111,7 @@ mem 项目 5/60  ·  全局 3
 
 ### 写入的东西长什么样
 
-写进 `<项目>/AGENTS.md`，**只在自己标记之间操作，你手写的内容一字不动**：
+写入位置取决于项目类型：普通项目写入 `<项目>/AGENTS.md`；包含多个 Git worktree 的仓库写入共同 `.git/pi-memory/memory.md`。**只在自己标记之间操作，你手写的内容一字不动**：
 
 ```markdown
 # 我的项目
@@ -119,21 +121,23 @@ mem 项目 5/60  ·  全局 3
 <!-- pi-memory:start -->
 ## 项目记忆
 
-- [decision] 项目身份用归一化 cwd，不用 git remote
-  理由：git remote 会让多 worktree 合并
+- [decision] 同一 Git worktree 集合共用一个任务栏条目
+  理由：worktree 共享同一份历史与对象库，拆成两条会让人误以为换了项目
 - [pitfall] switchSession 只在命令上下文上有
 > 更早的 8 条已归档：`.pi/memory-archive.md`（需要时自行 read/grep）
 <!-- pi-memory:end -->
 ```
 
-超过软上限（默认 60 行）时，最旧的条目被**剪进** `.pi/memory-archive.md`——一条不丢，只是不再注入。
+超过软上限（默认 60 行）时，最旧的条目被**剪进**对应的 `memory-archive.md`——一条不丢，只是不再注入。
+
+worktree 的共享记忆位于共同 `.git/pi-memory/`，不受分支切换影响、不进 Git；每次模型调用前会追加进当前 system prompt。
 
 ### 设计要点
 
-- **不重复造原生机制。** pi 已按 cwd 逐级向上查找并全量注入 `AGENTS.md`，所以**注入部分零代码**。代价是全局层被注入到每个项目，所以本项目不碰全局层。
+- **不重复造原生机制。** pi 已按 cwd 逐级向上查找并全量注入普通项目的 `AGENTS.md`；worktree 共享记忆则通过 `before_agent_start` 追加，避免把本地共享文件放进某个分支的 checkout。
 - **记忆单位是「一次任务执行过程的压缩结论」**，不是原子事实——最重的那道压缩 pi 的 compaction 已经做了（它的 `## Key Decisions` / `## Critical Context` 正好是记忆该装的东西）。
 - **写入不打断任务。** `memory_write` 只入队、立即返回；确认框在 `agent_settled`（pi 不会再自动继续时）才弹一次，N 条合并成一次确认。队列持久化到磁盘，直接退出 pi 也不丢。
-- **门禁：只在"看起来是项目"的目录写。** 因为 `AGENTS.md` 是逐级向上查找的，在祖先目录（尤其家目录）写会渗漏到其下所有项目。家目录**显式排除**——它本身可能就是 git 仓库，只靠 `.md` 标记判定会误放行。
+- **门禁：只在"看起来是项目"的目录写。** 因为 `AGENTS.md` 是逐级向上查找的，在祖先目录（尤其家目录）写会渗漏到其下所有项目。家目录**显式排除**——它本身可能就是 git 仓库，只靠 `.md` 标记判定会误放行。共享 worktree 记忆仍要求 cwd 位于真实项目内。
 - **跨进程写锁 + 拿锁后重读。** 两个 pi 同时 flush 时，`writeAtomic`（临时文件 + rename）只保证不写坏文件，仍是 last-write-wins——后写的会静默吃掉另一次的记忆。所以先取独占锁（`O_EXCL` 创建，原子），**拿到后重新读取**再应用增量。瞬态失败（锁冲突）放回队列重试；永久失败（目录已删）丢弃并说明，避免永远卡在队列里。
 - **不把已删除的目录重建出来。** 目标目录不存在时直接拒绝写入——否则 `mkdir(recursive)` 会凭空造出一棵空目录树，而你只以为自己确认了一条记忆。
 
@@ -160,8 +164,8 @@ npm test          # 两个冒烟测试
 
 两个测试都是**端到端冒烟测试**：用与 pi 相同的 jiti + alias 真实加载扩展，喂假 `ctx`，验证真实逻辑。全程在临时沙箱里跑。
 
-- `test/smoke-tasks.mjs` — 19 项断言
-- `test/smoke-memory.mjs` — 80 项断言。会话夹具用 pi 自己的 `SessionManager` 生成（而不是手写 JSONL），所以 pi 改了文件格式不会让测试假绿
+- `test/smoke-tasks.mjs` — 24 项断言
+- `test/smoke-memory.mjs` — 86 项断言。会话夹具用 pi 自己的 `SessionManager` 生成（而不是手写 JSONL），所以 pi 改了文件格式不会让测试假绿
 
 测试**不碰**你真实的 `~/.pi`，也不碰真实家目录——`PI_CODING_AGENT_DIR` 和 `USERPROFILE`/`HOME` 都被指向沙箱。
 
@@ -177,8 +181,9 @@ npm test          # 两个冒烟测试
 4. **`absorb` 只认固定的小节名**（`Key Decisions` / `Critical Context` / `Constraints & Preferences`），pi 改摘要格式会静默失效。
 5. **软上限只统计"条目行"**，手写进记忆区的大段说明不计入。
 6. **索引全量重建是 O(全部会话)**，几千个会话时会明显变慢。
-7. **项目身份用 cwd**，换 clone 位置记忆会断；同一 repo 的多个 clone 会被算作两个项目。
-8. **pi-memory 不管理全局层**（设计如此，不是 bug）。
+7. **项目身份默认用 cwd**，换 clone 位置仍会让索引和记忆分开；同一 repo 的多个 Git worktree 会合并为一个任务栏项目和一份本地共享记忆。
+8. **共享 worktree 记忆是本地 `.git/pi-memory/` 文件**，不会被 Git 提交或团队共享；需要团队共享时仍应把明确的项目规则手写进版本库中的 `AGENTS.md`。
+9. **pi-memory 不管理全局层**（设计如此，不是 bug）。
 
 ---
 

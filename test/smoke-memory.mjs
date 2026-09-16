@@ -12,6 +12,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { makeSandbox, loadExtension, makeChecker } from "./_harness.mjs";
 
 const { check, summary } = makeChecker();
@@ -41,6 +42,18 @@ fs.mkdirSync(FAKE_HOME, { recursive: true });
 // 家目录故意造成一个 git 仓库（模拟真实情况）——
 // 这曾让仅靠标记判定的门禁误放行。
 fs.mkdirSync(path.join(FAKE_HOME, ".git"), { recursive: true });
+
+const WT_REPO = SB.path("worktree-repo");
+const WT_FEATURE = path.join(WT_REPO, ".worktrees", "feature");
+fs.mkdirSync(WT_REPO, { recursive: true });
+const git = (args, cwd = WT_REPO) => execFileSync("git", args, { cwd, encoding: "utf8", windowsHide: true });
+git(["init", "-q", "-b", "main"]);
+git(["config", "user.name", "测试用户"]);
+git(["config", "user.email", "test@example.invalid"]);
+fs.writeFileSync(path.join(WT_REPO, "README.md"), "# memory worktree fixture\n", "utf8");
+git(["add", "README.md"]);
+git(["commit", "-q", "-m", "初始化记忆夹具"]);
+git(["worktree", "add", "-q", "-b", "feature/memory", WT_FEATURE]);
 
 const USER_CONTENT = "# 我的项目\n\n这是我自己写的说明，扩展不该动它。\n\n## 构建\n\n用 pnpm。\n";
 fs.writeFileSync(path.join(PROJ, "AGENTS.md"), USER_CONTENT, "utf8");
@@ -110,6 +123,8 @@ function mkCtx(cwd, entries = []) {
 
 const ctxProj = mkCtx(PROJ);
 const ctxHome = mkCtx(FAKE_HOME);
+const ctxWorktreeMain = mkCtx(WT_REPO);
+const ctxWorktreeFeature = mkCtx(WT_FEATURE);
 
 factory(pi);
 console.log("✔ 注册:", {
@@ -487,8 +502,27 @@ const finalC = read(PROJ_AGENTS);
 check("别人的并发写入没被覆盖", finalC.includes("别的进程同时加的"));
 check("自己的条目也写进去了", finalC.includes("本进程新加的"));
 
-// ═══ 16. session_shutdown 清理 ═══════════════════════════
-console.log("\n═══ 16. session_shutdown ═══");
+// ═══ 15d. 多 worktree 共享项目记忆 ═══════════════════════
+console.log("\n--- 多 worktree 共享项目记忆 ---");
+const sharedMemory = path.join(WT_REPO, ".git", "pi-memory", "memory.md");
+const sharedArchive = path.join(WT_REPO, ".git", "pi-memory", "memory-archive.md");
+const beforeSharedMain = path.join(WT_REPO, "AGENTS.md");
+const beforeSharedFeature = path.join(WT_FEATURE, "AGENTS.md");
+idle = false;
+await write({ text: "worktree 共享记忆只存一份", tag: "decision" }, ctxWorktreeMain);
+idle = true;
+reset();
+selectAnswer = "全部写入";
+await settle(ctxWorktreeMain);
+selectAnswer = undefined;
+check("共享记忆写入共同 .git 目录", (read(sharedMemory) ?? "").includes("worktree 共享记忆只存一份"));
+check("主 worktree 未生成分支 AGENTS.md", !fs.existsSync(beforeSharedMain));
+check("feature worktree 未生成分支 AGENTS.md", !fs.existsSync(beforeSharedFeature));
+check("共享归档路径与目标一致", path.dirname(sharedArchive) === path.dirname(sharedMemory));
+const beforeStart = handlers.before_agent_start?.[0];
+const injected = await beforeStart?.({ type: "before_agent_start", prompt: "测试", systemPrompt: "基础系统提示" }, ctxWorktreeFeature);
+check("feature worktree 能读到主 worktree 写入的共享记忆", injected?.systemPrompt.includes("worktree 共享记忆只存一份"));
+check("共享记忆注入保留基础 system prompt", injected?.systemPrompt.startsWith("基础系统提示"));
 for (const h of handlers.session_shutdown ?? []) await h({ type: "session_shutdown" }, ctxProj);
 check("status 已清除", cap.status.get("pi-memory") === undefined);
 

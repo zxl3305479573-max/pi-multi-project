@@ -7,13 +7,14 @@
  *   （零依赖、完全可控），扩展在这里是负收益。
  *
  * 设计原则：
- *   1. 不重复造 pi 原生机制。pi 已按 cwd 逐级向上查找并全量注入 AGENTS.md，
- *      所以**注入部分零代码**。
+ *   1. 不重复造 pi 原生机制。普通项目仍由 pi 按 cwd 逐级注入 AGENTS.md；
+ *      只有 Git worktree 集合的共享记忆通过 before_agent_start 追加进本轮 prompt。
  *   2. 记忆单位是「一次任务执行过程的压缩结论」，不是原子事实。
  *      最重的第一道压缩 pi 的 compaction 已经做完，本扩展只提取与去临时化。
  *   3. 存储落在人可读可编辑的文件里，不是隐藏的数据库：
- *        项目知识  <项目>/AGENTS.md                「## 项目记忆」
- *        冷归档    <项目>/.pi/memory-archive.md    （不进 system prompt）
+ *        普通项目    <项目>/AGENTS.md                「## 项目记忆」
+ *        worktree    <共同 .git>/pi-memory/memory.md  「## 共享项目记忆」（本地、不进 Git）
+ *        冷归档      与热记忆同目录的 memory-archive.md（不进 system prompt）
  *   4. 软上限只提示，不自动删。超限时把最旧条目剪切进归档，一条不丢。
  *   5. 门禁：只在「看起来是项目」的目录写。因为 AGENTS.md 是逐级向上查找的，
  *      在祖先目录（尤其家目录）写会渗漏到其下所有项目。
@@ -26,6 +27,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -95,7 +97,9 @@ interface Target {
 	heading: string;
 	note: string;
 	/** 展示用的层次标签，直接进页脚 */
-	layer: "全局" | "项目";
+	layer: "全局" | "项目" | "共享项目";
+	/** true = 同一 Git worktree 集合共用的、本地 .git 内记忆 */
+	shared: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -154,14 +158,80 @@ function countBullets(file: string): number {
 	return (readFileSafe(file).match(/^\s*[-*]\s+\S/gm) ?? []).length;
 }
 
-/** 目标永远是当前 cwd 的项目层。全局层不再由本扩展管。 */
+/**
+ * 同一 Git worktree 集合的共享存储。
+ *
+ * 只在 `git worktree list` 至少有两个目录时启用；普通 Git 项目保持旧的
+ * `<cwd>/AGENTS.md` 语义。共同 git dir 位于 .git 内，本地于 clone：不进分支、
+ * 不随 checkout 改变，也不会被 pi 的祖先 AGENTS.md 扫描误注入。
+ *
+ * 带缓存：resolveTarget 在 turn_end、status、flush 等多个路径上被调用，
+ * 每次都起两次 git 子进程会造成不必要的卡顿。命中的键包括同组的兄弟 worktree。
+ */
+const sharedGitCache = new Map<string, { at: number; value: string | undefined }>();
+const SHARED_GIT_TTL_MS = 30_000;
+
+function detectSharedGitDir(cwd: string): string | undefined {
+	try {
+		const common = spawnSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+			cwd,
+			encoding: "utf8",
+			windowsHide: true,
+			timeout: 2500,
+		});
+		if (common.status !== 0) return undefined;
+		const commonDir = common.stdout.trim();
+		if (!commonDir || !path.isAbsolute(commonDir)) return undefined;
+
+		const list = spawnSync("git", ["worktree", "list", "--porcelain"], {
+			cwd,
+			encoding: "utf8",
+			windowsHide: true,
+			timeout: 2500,
+		});
+		const roots = [...list.stdout.matchAll(/^worktree (.+)$/gm)].map((m) => m[1].trim());
+		if (roots.length < 2) return undefined;
+
+		// 同组兄弟共享同一份记忆，直接写入缓存。
+		const at = Date.now();
+		for (const root of roots) sharedGitCache.set(normPathKey(root), { at, value: commonDir });
+		return commonDir;
+	} catch {
+		return undefined;
+	}
+}
+
+function sharedGitDir(cwd: string): string | undefined {
+	const ck = normPathKey(cwd);
+	const hit = sharedGitCache.get(ck);
+	if (hit && Date.now() - hit.at < SHARED_GIT_TTL_MS) return hit.value;
+
+	const value = detectSharedGitDir(cwd);
+	sharedGitCache.set(ck, { at: Date.now(), value });
+	return value;
+}
+
+/** 普通项目保留 AGENTS.md；同仓库多 worktree 才切到共同 .git 的本地共享区。 */
 function resolveTarget(cwd: string): Target {
+	const commonGitDir = sharedGitDir(cwd);
+	if (commonGitDir) {
+		const dir = path.join(commonGitDir, "pi-memory");
+		return {
+			file: path.join(dir, "memory.md"),
+			archive: path.join(dir, "memory-archive.md"),
+			heading: "共享项目记忆",
+			note: "同一 Git worktree 集合共享 · 本地 .git，不进 Git",
+			layer: "共享项目",
+			shared: true,
+		};
+	}
 	return {
 		file: path.join(cwd, "AGENTS.md"),
 		archive: path.join(cwd, ".pi", "memory-archive.md"),
 		heading: "项目记忆",
 		note: "项目层",
 		layer: "项目",
+		shared: false,
 	};
 }
 
@@ -529,9 +599,9 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			const dir = path.dirname(target.file);
-			// 项目目录可能在入队之后被删除/移动。
-			// 绝不能靠 writeAtomic 里的 mkdir('recursive') 把它凭空创建回来。
-			if (!fs.existsSync(dir)) {
+			// 普通项目目录消失时拒绝重建；共享目标位于既有的共同 .git，
+			// 首次写入允许创建它下面的 pi-memory 子目录。
+			if (!target.shared && !fs.existsSync(dir)) {
 				return {
 					ok: false,
 					kept: [],
@@ -653,7 +723,7 @@ export default function (pi: ExtensionAPI) {
 		if (canHostProjectMemory(ctx.cwd)) {
 			const target = resolveTarget(ctx.cwd);
 			const n = entryLines(readMemory(target.file).entries);
-			parts.push(`项目 ${n}/${config.softLimit}`);
+			parts.push(`${target.layer} ${n}/${config.softLimit}`);
 			if (n > config.softLimit) parts.push("⚠ 超上限");
 		}
 
@@ -688,6 +758,7 @@ export default function (pi: ExtensionAPI) {
 			`已排队（第 ${pending.length} 条 · 来源 ${source}）`,
 			...renderEntry(toEntry(item)).map((l) => `  ${l}`),
 			`目标：${target.file}`,
+			...(target.shared ? ["共享范围：同一 Git worktree 集合（本地 .git，不进 Git）"] : []),
 			"",
 			"任务结束后会统一弹一次确认框再写入，不打断当前执行。",
 		].join("\n");
@@ -829,6 +900,18 @@ export default function (pi: ExtensionAPI) {
 
 	// ── 事件 ────────────────────────────────────────────────
 
+	pi.on("before_agent_start", async (event, ctx) => {
+		if (!canHostProjectMemory(ctx.cwd)) return undefined;
+		const target = resolveTarget(ctx.cwd);
+		if (!target.shared) return undefined;
+
+		const content = readFileSafe(target.file).trim();
+		if (!content) return undefined;
+		return {
+			systemPrompt: `${event.systemPrompt}\n\n<!-- pi-memory:shared-worktree -->\n${content}\n<!-- pi-memory:shared-worktree:end -->`,
+		};
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		loadPending();
 		updateStatus(ctx);
@@ -867,7 +950,7 @@ export default function (pi: ExtensionAPI) {
 		name: "memory_write",
 		label: "Memory Write",
 		description:
-			"把值得长期记住的项目结论写进当前项目的 <cwd>/AGENTS.md。用于记录：项目的架构决策及其理由、踩过的坑、不易从代码推断的约定。" +
+			"把值得长期记住的项目结论写进项目记忆。普通项目写入 <cwd>/AGENTS.md；多 Git worktree 项目写入共同 .git/pi-memory/memory.md。用于记录：项目的架构决策及其理由、踩过的坑、不易从代码推断的约定。" +
 			"不要记录：能从仓库文件读出来的事实（会过时）、一次性的问答、临时的下一步计划。" +
 			"跨项目的个人偏好不要用本工具（请让用户手写 ~/.pi/agent/AGENTS.md）。" +
 			"本工具只入队、立即返回，不会打断任务；任务真正结束后会统一弹一次确认框，用户可能拒绝。",
@@ -1100,7 +1183,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// 目标固定为当前 cwd 的项目层（门禁已在入口拦住非项目目录）
+		// 目标可能是普通项目的 AGENTS.md，也可能是 worktree 集合的共享文件。
 		const groups: { target: Target; items: { tag: string; text: string }[] }[] = [];
 		groups.push({ target: resolveTarget(ctx.cwd), items: candidates });
 
